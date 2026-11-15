@@ -9,11 +9,18 @@ request's requirements (tools, vision, JSON mode, context length). When a provid
 
 ## How it works
 
-- **Routing** (`lib/providers.ts`): candidates are free models meeting the request's requirements,
-  ordered by the brief's quality table. A JSON-mode request from an OpenAI client only goes to a wire
-  that can carry `response_format` (OpenAI or Gemini). The first pick takes a small penalty per
-  consecutive failure of its provider, which spreads calls over the providers' per-trial budgets; the
-  failover chain inside one request follows the raw rating order.
+- **Routing** (`lib/providers.ts`, `lib/plan.ts`): the trial runs on a FIXED PLAN of
+  exactly twenty calls — one provider and model per request (`lib/plan.ts`), derived
+  from the public practice/trial-0 draw so no provider is asked for more than it can
+  answer on that instance (the greedy best-first router instead concentrates 14 calls
+  on openrouter and 9 on cloudflare, and both run out of budget mid-trial: 7 of its
+  27 calls are refusals). The planned call goes first; when it refuses, the adaptive
+  chain (provider-aware tryOrder over the remaining candidates) serves the request.
+  Candidates are free models meeting the request's requirements, ordered by the brief's
+  quality table. A JSON-mode request from an OpenAI client only goes to a wire that
+  can carry `response_format` (OpenAI or Gemini). The first pick takes a small penalty
+  per consecutive failure of its provider, which spreads calls over the providers'
+  per-trial budgets; the failover chain inside one request follows the raw rating order.
 - **Wires** (`lib/wire.ts`, `lib/gemini.ts`): the client's request is translated into the provider's
   wire with everything it carries — system prompt, user text and images, tools and tool results, stop
   sequences, output cap, JSON mode — and the provider's answer is translated back into the client's
@@ -41,6 +48,10 @@ alone; nothing to install.
 ## Test it locally
 
 ```sh
+# Unit tests (no trial needed): routing order + the twenty-call plan, mock draws
+node test-routing.ts
+node test-plan.ts
+
 # From the unpacked kit directory, with the process driver (no Docker needed):
 node cli/makefun.mjs grade-local --kit . --bot <this directory> --driver process
 node cli/makefun.mjs grade-local --kit . --bot <this directory> --driver process --instances 3

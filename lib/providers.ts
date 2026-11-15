@@ -543,3 +543,33 @@ export function noteCall(streaks: FailureStreaks, providerId: string, ok: boolea
   if (ok) streaks.delete(providerId);
   else streaks.set(providerId, (streaks.get(providerId) ?? 0) + 1);
 }
+
+/**
+ * The planned candidate among a request's candidates, when the fixed plan
+ * (lib/plan.ts) names a provider and model for it and that model is among the
+ * candidates: the provider answered the probe and the model meets the
+ * request's requirements. Null when the plan has no call for the request, or
+ * when the planned model cannot serve it (the provider did not answer, or
+ * the listing does not carry the model): then the adaptive chain serves it.
+ */
+export function findPlanned(candidates: readonly Candidate[], providerId: string, modelId: string): Candidate | null {
+  return candidates.find((c) => c.probe.provider.id === providerId && c.model.id === modelId) ?? null;
+}
+
+/**
+ * The order to try the candidates in for one request when a fixed plan names
+ * its first call: the planned candidate first, then the adaptive chain
+ * (tryOrder) over the rest. The planned candidate is walked exactly once —
+ * it is taken out of the fallback order, so a refusal of it does not try it
+ * again. Without a planned candidate this is just tryOrder.
+ *
+ * Why the plan goes first and never moves: the plan is the twenty calls the
+ * trial is budgeted for. The adaptive chain is the fallback for a draw the
+ * plan was not derived from; it only runs when the planned call refuses.
+ * The order is fixed once per request, as tryOrder's is.
+ */
+export function tryOrderWithPlan(candidates: readonly Candidate[], planned: Candidate | null, streaks: FailureStreaks): Candidate[] {
+  if (planned === null) return tryOrder(candidates, streaks);
+  const rest = candidates.filter((c) => !(c.probe.provider.id === planned.probe.provider.id && c.model.id === planned.model.id));
+  return [planned, ...tryOrder(rest, streaks)];
+}

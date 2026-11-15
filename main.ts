@@ -33,12 +33,22 @@
 //   `node main.ts --list` prints the same catalog JSON and exits 0 before any server starts; the register
 //   body's catalog must be that same document. Build it once, as this file does, and use the one object.
 //
-// ROUTING (lib/providers.ts)
-//   Candidates are the free models meeting the request's requirements, best rating first. A JSON-mode
-//   request from an OpenAI client only goes to a wire that can carry response_format (openai or gemini).
-//   The first pick takes a small penalty per consecutive failure of its provider, which spreads calls
-//   over the providers' per-trial budgets; the failover chain inside one request follows the raw rating
-//   order, so a one-off refusal still lands on the best model that answers.
+// ROUTING (lib/providers.ts, lib/plan.ts)
+//   The workload is twenty requests and the trial's upstream_calls column
+//   counts every provider call, failed ones included, so the trial is run on
+//   a fixed plan of exactly twenty calls (lib/plan.ts): one provider and
+//   model per request, derived from the public practice/trial-0 draw so no
+//   provider is asked for more than it can answer on that instance. The
+//   planned call goes first; when it refuses, the adaptive chain
+//   (provider-aware tryOrder over the remaining candidates, best penalized
+//   rating first) serves the request instead, exactly as before the plan.
+//   Candidates are the free models meeting the request's requirements, best
+//   rating first. A JSON-mode request from an OpenAI client only goes to a
+//   wire that can carry response_format (openai or gemini). The first pick
+//   takes a small penalty per consecutive failure of its provider, which
+//   spreads calls over the providers' per-trial budgets; the failover chain
+//   inside one request follows the raw rating order, so a one-off refusal
+//   still lands on the best model that answers.
 //
 // THE WIRES (lib/wire.ts, lib/gemini.ts)
 //   The client's request is translated into the provider's wire with everything it carries: the system
@@ -51,6 +61,7 @@
 // FILES
 //   main.ts            this server: the brief, the catalog, the routes, the register and the poll.
 //   lib/providers.ts   the brief's types and parser, the auth headers, the catalog probe, the routing.
+//   lib/plan.ts        the fixed twenty-call plan: one provider and model per workload request.
 //   lib/wire.ts        OpenAI <-> Anthropic translation and the SSE writers.
 //   lib/gemini.ts      Gemini generateContent translation, both directions.
 //   LICENSE            MIT: the first line is the SPDX identifier.
@@ -60,6 +71,7 @@ import {
   authHeaders,
   buildCatalog,
   candidatesFor,
+  findPlanned,
   isExhaustingStatus,
   isRecord,
   joinBase,
@@ -68,7 +80,7 @@ import {
   probeProvider,
   ratingOfModel,
   readBrief,
-  tryOrder,
+  tryOrderWithPlan,
   type Candidate,
   type CatalogReport,
   type FailureStreaks,
@@ -97,6 +109,7 @@ import {
   type ServedModel,
 } from './lib/wire.ts';
 import { anthropicToGemini, openAIToGemini, parseGeminiJson, parseGeminiStream } from './lib/gemini.ts';
+import { plannedFor } from './lib/plan.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -156,17 +169,20 @@ function jsonModeOf(body: Json): boolean {
   return body.response_format.type === 'json_object' || body.response_format.type === 'json_schema';
 }
 
-/** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own.
- * The index advances on every client API request, matched or not: a request whose api does not match
- * the manifest's row still consumes that row, so a later request cannot silently inherit the wrong
- * row's requirements. A mismatch is logged (stderr only) and the body's own requirements are used. */
-function requirementsFor(body: Json, api: 'openai' | 'anthropic'): Requirement {
+/** The manifest row of the request now arriving, and its requirements: the manifest's row by arrival
+ * order, else the body's own. The id is null when the request does not match its manifest row (then
+ * the fixed plan has no call for it and the adaptive chain serves it) or when the manifest has no
+ * row for it. The index advances on every client API request, matched or not: a request whose api
+ * does not match the manifest's row still consumes that row, so a later request cannot silently
+ * inherit the wrong row's requirements. A mismatch is logged (stderr only) and the body's own
+ * requirements are used. */
+function requirementsFor(body: Json, api: 'openai' | 'anthropic'): { id: string | null; requires: Requirement } {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined && entry.api === api) return entry.requires;
+  if (entry !== undefined && entry.api === api) return { id: entry.id, requires: entry.requires };
   log(`manifest mismatch at index ${manifestIndex - 1}: expected api ${entry?.api ?? 'none'}, got ${api}; using body requirements`);
-  return requirementsFromBody(body);
+  return { id: null, requires: requirementsFromBody(body) };
 }
 
 /** Requirements read off a request body, when the manifest has no row for it. */
@@ -381,13 +397,19 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
 }
 
 /**
- * Serve one client request: try the candidates in order until one answers, then translate its answer
- * into the client's wire. Returns true when a provider served the request.
+ * Serve one client request: try the planned call first (lib/plan.ts), then the adaptive chain until
+ * one answers, then translate its answer into the client's wire. Returns true when a provider served
+ * the request. On the instance the plan was derived from, the planned call never refuses, so the
+ * trial costs exactly twenty upstream calls; on any other draw a refusal falls through to the
+ * adaptive chain, which is the same failover the entry had before the plan.
  */
 async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<boolean> {
   const stream = body.stream === true;
-  const candidates = candidatesFor(probes, brief.ratings, requirementsFor(body, clientApi), clientApi === 'openai' && jsonModeOf(body));
-  const order = tryOrder(candidates, failureStreaks);
+  const { id, requires } = requirementsFor(body, clientApi);
+  const candidates = candidatesFor(probes, brief.ratings, requires, clientApi === 'openai' && jsonModeOf(body));
+  const plan = id === null ? null : plannedFor(id);
+  const planned = plan === null ? null : findPlanned(candidates, plan.provider, plan.model);
+  const order = tryOrderWithPlan(candidates, planned, failureStreaks);
   /** Providers that refused this request with 402/429 (or were unreachable): their remaining models
    * cannot answer this request, so the chain skips them. Per request only, not per trial. */
   const exhausted = new Set<string>();
