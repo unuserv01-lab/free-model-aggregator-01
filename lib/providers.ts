@@ -28,10 +28,13 @@
 // Routing: candidates are free models meeting the request's requirements, ordered by the quality table's
 // rating. A JSON-mode request from an OpenAI client is only sent to a wire that can carry
 // response_format (openai or gemini): an anthropic-wire provider echoes json_mode false, which would
-// fail the client's echo check. The first pick of a request is by rating minus a small penalty per
-// consecutive failure of that provider (a provider that just refused is tried after its equal-rated
-// peers, which spreads calls over the per-trial budgets); the failover chain inside one request then
-// follows the raw rating order, so a one-off refusal still lands on the best model that answers.
+// fail the client's echo check. The try order is provider-aware: candidates are grouped by provider,
+// providers are ranked by the best penalized rating among their models (rating minus a small penalty
+// per consecutive failure of that provider), and models run best-first inside their provider. Once a
+// provider refuses with 402 or 429 its budget is spent, so its remaining models cannot answer this
+// request and the chain moves on to the next provider instead of burning calls on a dry provider.
+// The order is fixed once per request, so a failure streak that moves mid-request cannot reshuffle
+// a chain already being walked.
 
 import { readFileSync } from 'node:fs';
 
@@ -486,17 +489,53 @@ export function penalizedRating(candidate: Candidate, streaks: FailureStreaks): 
 }
 
 /**
- * The order to try the candidates in for one request: the penalized best first (so a provider that just
- * refused is tried after its equal-rated peers), then the rest in raw rating order. The first element is
- * the request's first pick; the rest is its failover chain.
+ * Whether an upstream status means the provider cannot serve this request any further: its budget
+ * is spent (402 for one provider, 429 for the rest) or the call never reached it at all (status 0:
+ * a refused connection or a timeout). A 5xx is deliberately not exhausting — it may be one model's
+ * transient failure while another model of the same provider still answers. Exhaustion is per
+ * request only: a failure-schedule 429 is one refusal, not proof the provider is spent for the
+ * trial, so a later request may try it again.
+ */
+export function isExhaustingStatus(status: number): boolean {
+  return status === 0 || status === 402 || status === 429;
+}
+
+/**
+ * The order to try the candidates in for one request, provider-aware: candidates are grouped by
+ * provider, providers are ranked by the best penalized rating among their models, and the models
+ * inside a provider run best penalized rating first. The first element is the request's first pick;
+ * the rest is its failover chain, provider by provider.
+ *
+ * Why grouped: once a provider's budget is spent it refuses every further call with 402 (one
+ * provider) or 429 (the rest), so trying a second model of a provider that just refused on 402/429
+ * only burns a call the provider cannot answer. Grouping keeps the chain on providers that can
+ * still serve, while the first pick still honours the failure penalty.
+ *
+ * The order is computed once per request from the streaks as they stand at the request's start.
+ * noteCall() moves the streaks while the request is served, but the order is not recomputed
+ * mid-request, so a streak change cannot reshuffle a chain already being walked. Deterministic:
+ * every comparison ends in a tie-break on ids, and no clock or randomness is read.
  */
 export function tryOrder(candidates: readonly Candidate[], streaks: FailureStreaks): Candidate[] {
-  if (candidates.length === 0) return [];
-  let first = candidates[0];
+  const byProvider = new Map<string, Candidate[]>();
   for (const candidate of candidates) {
-    if (penalizedRating(candidate, streaks) > penalizedRating(first, streaks)) first = candidate;
+    const group = byProvider.get(candidate.probe.provider.id);
+    if (group !== undefined) group.push(candidate);
+    else byProvider.set(candidate.probe.provider.id, [candidate]);
   }
-  return [first, ...candidates.filter((c) => c !== first)];
+  const byPenalized = (a: Candidate, b: Candidate): number =>
+    penalizedRating(b, streaks) - penalizedRating(a, streaks) || b.rating - a.rating || byCandidateId(a, b);
+  const groups = [...byProvider.values()].map((group) => {
+    const models = [...group].sort(byPenalized);
+    return { models, best: models[0] };
+  });
+  groups.sort(
+    (a, b) =>
+      penalizedRating(b.best, streaks) - penalizedRating(a.best, streaks) ||
+      b.best.rating - a.best.rating ||
+      (a.best.probe.provider.id < b.best.probe.provider.id ? -1 : 1),
+  );
+  return groups.flatMap((g) => g.models);
 }
 
 /** Record one provider call's outcome for the failure penalty: a success clears the streak. */

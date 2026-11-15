@@ -60,6 +60,7 @@ import {
   authHeaders,
   buildCatalog,
   candidatesFor,
+  isExhaustingStatus,
   isRecord,
   joinBase,
   modelFree,
@@ -155,14 +156,16 @@ function jsonModeOf(body: Json): boolean {
   return body.response_format.type === 'json_object' || body.response_format.type === 'json_schema';
 }
 
-/** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
+/** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own.
+ * The index advances on every client API request, matched or not: a request whose api does not match
+ * the manifest's row still consumes that row, so a later request cannot silently inherit the wrong
+ * row's requirements. A mismatch is logged (stderr only) and the body's own requirements are used. */
 function requirementsFor(body: Json, api: 'openai' | 'anthropic'): Requirement {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
-  if (entry !== undefined && entry.api === api) {
-    manifestIndex += 1;
-    return entry.requires;
-  }
+  manifestIndex += 1;
+  if (entry !== undefined && entry.api === api) return entry.requires;
+  log(`manifest mismatch at index ${manifestIndex - 1}: expected api ${entry?.api ?? 'none'}, got ${api}; using body requirements`);
   return requirementsFromBody(body);
 }
 
@@ -353,7 +356,14 @@ async function callCandidate(clientApi: 'openai' | 'anthropic', body: Json, cand
   return { ok: true, status: response.status, text, answer, stream: null };
 }
 
-/** Copy a provider's event stream to the client as it arrives; end the response on any error. */
+/** Copy a provider's event stream to the client as it arrives; end the response on any error.
+ *
+ * Streaming contract, audited: a same-wire stream is passed through only after the client's
+ * headers are sent, so a break mid-stream cannot fail over to another provider — there is nowhere
+ * to send a second answer. The honest behaviour then is to end the response (never hang the
+ * client); the upstream fetch carries an 8 s timeout, so a stalled stream ends at the latest when
+ * that fires. A cross-wire stream is different: it is read whole and re-emitted by the caller, so
+ * its headers go out only after the answer parsed, and a failure there can still fail over. */
 async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
   const reader = stream.getReader();
   try {
@@ -378,11 +388,16 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerR
   const stream = body.stream === true;
   const candidates = candidatesFor(probes, brief.ratings, requirementsFor(body, clientApi), clientApi === 'openai' && jsonModeOf(body));
   const order = tryOrder(candidates, failureStreaks);
+  /** Providers that refused this request with 402/429 (or were unreachable): their remaining models
+   * cannot answer this request, so the chain skips them. Per request only, not per trial. */
+  const exhausted = new Set<string>();
   let lastError: string | null = null;
   for (const candidate of order) {
+    if (exhausted.has(candidate.probe.provider.id)) continue;
     const call = await callCandidate(clientApi, body, candidate, stream);
     if (!call.ok) {
       noteCall(failureStreaks, candidate.probe.provider.id, false);
+      if (isExhaustingStatus(call.status)) exhausted.add(candidate.probe.provider.id);
       lastError = call.error ?? `HTTP ${call.status}`;
       log(`failover: ${candidate.probe.provider.id}/${candidate.model.id} refused (${lastError})`);
       continue;
@@ -390,6 +405,7 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerR
     noteCall(failureStreaks, candidate.probe.provider.id, true);
     const wire = candidate.probe.provider.wire;
     if (stream && call.stream !== null) {
+      // Headers are already sent: a break inside pipeStream cannot fail over, it only ends the response.
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       await pipeStream(call.stream, res);
       return true;
